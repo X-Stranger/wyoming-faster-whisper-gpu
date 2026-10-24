@@ -1,4 +1,4 @@
-`name: Build Wyoming Faster Whisper GPU
+name: Build Wyoming Faster Whisper GPU
 
 on:
   workflow_dispatch:
