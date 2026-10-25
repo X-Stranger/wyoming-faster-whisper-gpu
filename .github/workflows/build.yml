@@ -44,6 +44,39 @@ jobs:
             https://github.com/OHF-Voice/wyoming-faster-whisper.git \
             upstream
 
+      - name: Pin PyAV below 19
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("upstream/pyproject.toml")
+          text = path.read_text()
+
+          dependency = '"av>=11,<19",'
+
+          if dependency not in text:
+              needle = '"faster-whisper>=1.2.1,<2",'
+
+              if needle not in text:
+                  raise SystemExit(
+                      "Could not locate faster-whisper dependency in pyproject.toml"
+                  )
+
+              text = text.replace(
+                  needle,
+                  needle + "\n" + dependency,
+                  1,
+              )
+
+              path.write_text(text)
+
+          print("PyAV dependency:")
+          for line in path.read_text().splitlines():
+              if '"av' in line:
+                  print(line)
+          PY
+
       - name: Prepare image metadata
         id: meta
         shell: bash
