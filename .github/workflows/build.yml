@@ -109,8 +109,8 @@ jobs:
           push: true
           provenance: true
           tags: |
-            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-gpu
-            ${{ steps.meta.outputs.image }}:sha-${{ steps.meta.outputs.sha }}
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-gpu-r1
+            ${{ steps.meta.outputs.image }}:sha-${{ steps.meta.outputs.sha }}-r1
           labels: |
             org.opencontainers.image.title=Wyoming Faster Whisper GPU
             org.opencontainers.image.description=GPU build of OHF-Voice/wyoming-faster-whisper
