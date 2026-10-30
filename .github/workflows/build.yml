@@ -65,6 +65,9 @@ jobs:
         run: |
           python -m pip install 'faster-whisper==1.2.1' 'ctranslate2==4.8.3' 'numpy==2.5.4' 'av>=11,<19' 'wyoming>=1.10.2,<2' 'pysilero-vad>=3.4,<4' aiohttp pytest==8.4.2 pytest-asyncio
           cd upstream
+          # __init__ reads importlib.metadata; PYTHONPATH alone does not install metadata.
+          # Keep the explicitly pinned CI dependencies unchanged.
+          python -m pip install --no-deps -e .
           PYTHONPATH=. python -m pytest -q tests/test_jarvis_encoder.py tests/test_models.py tests/test_dispatch_handler.py tests/test_env_args.py tests/test_health_check.py
 
       - name: Prepare image metadata
