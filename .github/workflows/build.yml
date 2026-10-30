@@ -18,6 +18,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - uses: actions/checkout@v4
+
       # Dockerfile.gpu produces a very large image (~10.7 GB).
       # GitHub's standard runner has only 14 GB SSD, so reclaim
       # as much preinstalled space as possible before building.
@@ -37,45 +39,33 @@ jobs:
 
       - name: Fetch upstream source
         shell: bash
+        env:
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
         run: |
+          test "$UPSTREAM_TAG" = "v3.8.1" || { echo "Review/retest Jarvis before changing upstream" >&2; exit 1; }
           git clone \
             --depth 1 \
-            --branch "${{ inputs.upstream_tag }}" \
+            --branch "$UPSTREAM_TAG" \
             https://github.com/OHF-Voice/wyoming-faster-whisper.git \
             upstream
 
-      - name: Pin PyAV below 19
+      - name: Apply reviewed shared-model Jarvis extension
         shell: bash
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
+          test "$(git -C upstream rev-parse HEAD)" = "8c9142ecfa8fdb5b3cea82ad1dcad71cc24ebab9"
+          git -C upstream apply --check "$GITHUB_WORKSPACE/patches/jarvis-shared-encoder.patch"
+          git -C upstream apply "$GITHUB_WORKSPACE/patches/jarvis-shared-encoder.patch"
 
-          path = Path("upstream/pyproject.toml")
-          text = path.read_text()
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-          dependency = '"av>=11,<19",'
-
-          if dependency not in text:
-              needle = '"faster-whisper>=1.2.1,<2",'
-
-              if needle not in text:
-                  raise SystemExit(
-                      "Could not locate faster-whisper dependency in pyproject.toml"
-                  )
-
-              text = text.replace(
-                  needle,
-                  needle + "\n" + dependency,
-                  1,
-              )
-
-              path.write_text(text)
-
-          print("PyAV dependency:")
-          for line in path.read_text().splitlines():
-              if '"av' in line:
-                  print(line)
-          PY
+      - name: Check shared-model extension without GPU or model downloads
+        shell: bash
+        run: |
+          python -m pip install 'faster-whisper==1.2.1' 'ctranslate2==4.8.3' 'numpy==2.5.4' 'av>=11,<19' 'wyoming>=1.10.2,<2' 'pysilero-vad>=3.4,<4' aiohttp pytest==8.4.2 pytest-asyncio
+          cd upstream
+          PYTHONPATH=. python -m pytest -q tests/test_jarvis_encoder.py tests/test_models.py tests/test_dispatch_handler.py tests/test_env_args.py tests/test_health_check.py
 
       - name: Prepare image metadata
         id: meta
@@ -86,6 +76,7 @@ jobs:
           OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           SHA="$(git -C upstream rev-parse HEAD)"
 
+          echo "tag=${VERSION}-gpu-jarvis-${GITHUB_SHA:0:12}" >> "${GITHUB_OUTPUT}"
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "sha=${SHA}" >> "${GITHUB_OUTPUT}"
           echo "image=ghcr.io/${OWNER}/wyoming-faster-whisper-gpu" >> "${GITHUB_OUTPUT}"
@@ -109,11 +100,20 @@ jobs:
           push: true
           provenance: true
           tags: |
-            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-gpu-r1
-            ${{ steps.meta.outputs.image }}:sha-${{ steps.meta.outputs.sha }}-r1
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:jarvis-${{ github.sha }}
           labels: |
             org.opencontainers.image.title=Wyoming Faster Whisper GPU
             org.opencontainers.image.description=GPU build of OHF-Voice/wyoming-faster-whisper
             org.opencontainers.image.url=https://github.com/OHF-Voice/wyoming-faster-whisper
             org.opencontainers.image.version=${{ steps.meta.outputs.version }}
-            org.opencontainers.image.revision=${{ steps.meta.outputs.sha }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            technology.bastion.upstream.revision=${{ steps.meta.outputs.sha }}
+
+      - name: Record immutable image tags
+        shell: bash
+        run: |
+          echo '### Shared-model Whisper image' >> "$GITHUB_STEP_SUMMARY"
+          echo '${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}' >> "$GITHUB_STEP_SUMMARY"
+          echo '${{ steps.meta.outputs.image }}:jarvis-${{ github.sha }}' >> "$GITHUB_STEP_SUMMARY"

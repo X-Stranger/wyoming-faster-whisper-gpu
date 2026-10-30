@@ -1,0 +1,695 @@
+diff --git a/.dockerignore b/.dockerignore
+index 3068546..baa790c 100644
+--- a/.dockerignore
++++ b/.dockerignore
+@@ -2,3 +2,5 @@
+ !wyoming_faster_whisper/*.py
+ !pyproject.toml
+ !docker_run.sh
++
++!wyoming_faster_whisper/jarvis-profile.json
+diff --git a/Dockerfile.gpu b/Dockerfile.gpu
+index 1f42e7a..5c4f391 100644
+--- a/Dockerfile.gpu
++++ b/Dockerfile.gpu
+@@ -84,7 +84,8 @@ ENV STT_DEVICE=cuda \
+     XDG_CACHE_HOME=/data \
+     MODELSCOPE_CACHE=/data/modelscope
+ 
+-EXPOSE 10300
++EXPOSE 10300 10500
++RUN .venv/bin/python3 -c "from pathlib import Path; import importlib.metadata as m; from wyoming_faster_whisper.jarvis_encoder import Profile; p=Profile(Path(\"wyoming_faster_whisper/jarvis-profile.json\")); assert {k:m.version(k) for k in p.data[\"gpu_versions\"]} == p.data[\"gpu_versions\"]"
+ 
+ # See the CPU image for why this is a Describe/Info round trip and why the start
+ # period is this long.
+diff --git a/pyproject.toml b/pyproject.toml
+index 6bf61b0..f9b4af6 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -23,7 +23,10 @@ classifiers = [
+ ]
+ dependencies = [
+     "wyoming>=1.10.2,<2",
+-    "faster-whisper>=1.2.1,<2",
++    "faster-whisper==1.2.1",
++    "ctranslate2==4.8.3",
++    "numpy==2.5.4",
++    "av>=11,<19",
+     "pysilero-vad>=3.4.0,<4",
+ ]
+ 
+@@ -110,3 +113,6 @@ hass = [
+ zeroconf = [
+     "wyoming[zeroconf]",
+ ]
++
++[tool.setuptools.package-data]
++wyoming_faster_whisper = ["jarvis-profile.json"]
+diff --git a/tests/test_jarvis_encoder.py b/tests/test_jarvis_encoder.py
+new file mode 100644
+index 0000000..1b14386
+--- /dev/null
++++ b/tests/test_jarvis_encoder.py
+@@ -0,0 +1,155 @@
++"""No GPU or model downloads:one model,parallel wake/STT,strict bounded RPC."""
++
++import asyncio
++import threading
++from pathlib import Path
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++from wyoming_faster_whisper import faster_whisper_handler as handler
++from wyoming_faster_whisper.jarvis_encoder import (
++    CROP_BYTES,
++    EncoderServer,
++    Profile,
++    SharedEncoder,
++    SttGate,
++    read_header,
++    write_message,
++)
++
++PROFILE = Path(__file__).resolve().parents[1] / "wyoming_faster_whisper/jarvis-profile.json"
++
++
++class Storage:
++    def to_device(self, device):
++        return np.arange(1500 * 1280, dtype=np.float32).reshape(1, 1500, 1280)
++
++
++class Extractor:
++    def __call__(self, pcm):
++        return np.zeros((128, 351), np.float32)
++
++
++class Model:
++    def __init__(self):
++        self.feature_extractor = Extractor()
++        self.model = SimpleNamespace(device="cuda", compute_type="float16")
++        self.started = threading.Event()
++        self.finish = threading.Event()
++
++    def encode(self, features):
++        return Storage()
++
++    def transcribe(self, *args, **kwargs):
++        def segments():
++            self.started.set()
++            assert self.finish.wait(3)
++            yield SimpleNamespace(text="свет включён")
++
++        return segments(), None
++
++
++def test_one_constructor_and_shared_object_while_STT_is_busy(monkeypatch):
++    calls = []
++    model = Model()
++
++    def construct(*args, **kwargs):
++        calls.append(kwargs)
++        return model
++
++    monkeypatch.setattr(handler.faster_whisper, "WhisperModel", construct)
++    transcriber = handler.FasterWhisperTranscriber(
++        "cached", "/data", device="cuda", compute_type="float16", num_workers=2
++    )
++    transcriber.jarvis_stt_gate = SttGate()
++    encoder = SharedEncoder(transcriber.model, Profile(PROFILE))
++    assert encoder.model is transcriber.model
++    assert len(calls) == 1 and calls[0]["num_workers"] == 2
++    assert encoder.feature_extractor is not model.feature_extractor
++
++    async def scenario():
++        stt = asyncio.create_task(asyncio.to_thread(transcriber.transcribe, "dummy.wav", "ru"))
++        try:
++            assert await asyncio.to_thread(model.started.wait, 1)
++            async with asyncio.timeout(0.5):
++                features = await asyncio.to_thread(encoder.encode, bytes(CROP_BYTES))
++            assert not stt.done() and features.shape == (9, 5120)
++        finally:
++            model.finish.set()
++            assert await stt == "свет включён"
++
++    asyncio.run(scenario())
++
++
++def test_real_RPC_serves_encode_and_health_and_rejects_profile():
++    async def scenario():
++        profile = Profile(PROFILE)
++        service = EncoderServer(profile, SharedEncoder(Model(), profile), max_pending=1)
++        server = await asyncio.start_server(service.handle, "127.0.0.1", 0)
++
++        async def request(op, identity=profile.digest):
++            reader, writer = await asyncio.open_connection(*server.sockets[0].getsockname()[:2])
++            try:
++                pcm = bytes(CROP_BYTES) if op == "encode" else b""
++                await write_message(
++                    writer,
++                    {
++                        "op": op,
++                        "request_id": "test",
++                        "profile_sha256": identity,
++                        "payload_bytes": len(pcm),
++                    },
++                    pcm,
++                )
++                header = await read_header(reader)
++                data = await reader.readexactly(header["payload_bytes"])
++                return header, data
++            finally:
++                writer.close()
++                await writer.wait_closed()
++
++        try:
++            header, data = await request("encode")
++            assert header["ok"] and len(data) == 9 * 5120 * 4
++            assert (await request("health"))[0]["ok"]
++            assert not (await request("encode", "wrong"))[0]["ok"]
++        finally:
++            server.close()
++            await server.wait_closed()
++
++    asyncio.run(scenario())
++
++
++def test_STT_gate_bounds_waiters_without_serializing_encoder():
++    gate = SttGate()
++    release = threading.Event()
++    entered = threading.Event()
++
++    def block():
++        entered.set()
++        assert release.wait(2)
++
++    first = threading.Thread(target=lambda: gate.run(block))
++    first.start()
++    assert entered.wait(1)
++    assert gate.admission.acquire(blocking=False)  # One waiting place.
++    try:
++        with pytest.raises(RuntimeError, match="full"):
++            gate.run(lambda: None)
++        assert SharedEncoder(Model(), Profile(PROFILE)).encode(bytes(CROP_BYTES)).shape == (9, 5120)
++    finally:
++        gate.admission.release()
++        release.set()
++        first.join()
++
++
++def test_profile_rejects_wrong_versions_and_weights(tmp_path, monkeypatch):
++    p = Profile(PROFILE)
++    monkeypatch.setattr("importlib.metadata.version", lambda k: "wrong")
++    with pytest.raises(ValueError, match="versions"):
++        p.validate_backend(tmp_path)
++    monkeypatch.setattr("importlib.metadata.version", lambda k: p.data["gpu_versions"][k])
++    (tmp_path / "model.bin").write_bytes(b"incorrect weights")
++    with pytest.raises(ValueError, match="weights"):
++        p.validate_backend(tmp_path)
+diff --git a/wyoming_faster_whisper/__main__.py b/wyoming_faster_whisper/__main__.py
+index 3907fa1..15323ef 100755
+--- a/wyoming_faster_whisper/__main__.py
++++ b/wyoming_faster_whisper/__main__.py
+@@ -4,6 +4,7 @@ import asyncio
+ import logging
+ import platform
+ import re
++from pathlib import Path
+ from functools import partial
+ from typing import TYPE_CHECKING, Any, Dict, Optional
+ 
+@@ -55,6 +56,11 @@ def get_parser() -> argparse.ArgumentParser:
+         )
+     )
+     parser.add_argument("--uri", required=True, help="unix:// or tcp://")
++    parser.add_argument("--jarvis-encoder-uri", help="Enable shared-model Jarvis RPC, e.g. tcp://0.0.0.0:10500")
++    parser.add_argument("--jarvis-encoder-profile", type=Path,
++                        default=Path(__file__).with_name("jarvis-profile.json"))
++    parser.add_argument("--jarvis-encoder-model-directory", type=Path,
++                        help="Exact cached full large-v3 directory; no download")
+     #
+     parser.add_argument(
+         "--zeroconf",
+@@ -290,7 +296,23 @@ async def main() -> None:
+             "min_silence_duration_ms": args.vad_min_silence_ms,
+         }
+ 
++    jarvis_profile = None
++    if args.jarvis_encoder_uri:
++        from .jarvis_encoder import Profile, endpoint
++
++        endpoint(args.jarvis_encoder_uri)
++        if (args.stt_library != SttLibrary.FASTER_WHISPER or args.device != "cuda"
++                or args.compute_type != "float16" or not args.jarvis_encoder_model_directory):
++            raise ValueError("Jarvis requires explicit faster-whisper/CUDA/float16 and cached directory")
++        if args.model not in ("Systran/faster-whisper-large-v3", str(args.jarvis_encoder_model_directory)):
++            raise ValueError("Jarvis is validated only with full large-v3")
++        jarvis_profile = Profile(args.jarvis_encoder_profile)
++        jarvis_profile.validate_backend(args.jarvis_encoder_model_directory)
++        args.model = str(args.jarvis_encoder_model_directory)
++        args.local_files_only = True
++
+     loader = ModelLoader(
++        whisper_num_workers=2 if jarvis_profile else 1,
+         preferred_stt_library=args.stt_library,
+         preferred_language=args.language,
+         download_dir=args.download_dir,
+@@ -314,7 +336,12 @@ async def main() -> None:
+ 
+     # Load model
+     _LOGGER.debug("Pre-loading transcriber")
+-    await loader.load_transcriber()
++    transcriber = await loader.load_transcriber()
++    encoder_server = None
++    if jarvis_profile:
++        from .jarvis_encoder import start
++
++        encoder_server = await start(transcriber, jarvis_profile, args.jarvis_encoder_uri)
+ 
+     names = await _load_names(args)
+ 
+@@ -334,15 +361,20 @@ async def main() -> None:
+         _LOGGER.debug("Zeroconf discovery enabled")
+ 
+     _LOGGER.info("Ready")
+-    await server.run(
+-        partial(
+-            DispatchEventHandler,
+-            wyoming_info,
+-            loader,
+-            names,
+-            vad_endpointing=args.vad_endpointing,
++    try:
++        await server.run(
++            partial(
++                DispatchEventHandler,
++                wyoming_info,
++                loader,
++                names,
++                vad_endpointing=args.vad_endpointing,
++            )
+         )
+-    )
++    finally:
++        if encoder_server is not None:
++            encoder_server.close()
++            await encoder_server.wait_closed()
+ 
+ 
+ def build_info(model_name: str, *, requires_external_vad: bool = True) -> Info:
+diff --git a/wyoming_faster_whisper/faster_whisper_handler.py b/wyoming_faster_whisper/faster_whisper_handler.py
+index eb45582..5727553 100644
+--- a/wyoming_faster_whisper/faster_whisper_handler.py
++++ b/wyoming_faster_whisper/faster_whisper_handler.py
+@@ -25,10 +25,12 @@ class FasterWhisperTranscriber(Transcriber):
+         cpu_threads: int = 4,
+         vad_parameters: Optional[Dict[str, Any]] = None,
+         task: Optional[str] = None,
++        num_workers: int = 1,
+     ) -> None:
+         self.vad_filter = vad_parameters is not None
+         self.vad_parameters = vad_parameters
+         self.task = task
++        self.jarvis_stt_gate = None
+ 
+         # CTranslate2 takes the GPU ordinal separately, so "cuda:1" has to be
+         # split into device + device_index.
+@@ -44,6 +46,7 @@ class FasterWhisperTranscriber(Transcriber):
+             device=ct2_device,
+             compute_type=compute_type,
+             cpu_threads=cpu_threads,
++            num_workers=num_workers,
+             **extra_args,
+         )
+ 
+@@ -62,6 +65,12 @@ class FasterWhisperTranscriber(Transcriber):
+         initial_prompt: Optional[str] = None,
+     ) -> str:
+ 
++        if self.jarvis_stt_gate is not None:
++            return self.jarvis_stt_gate.run(self._transcribe, wav_path, language,
++                                            beam_size, initial_prompt)
++        return self._transcribe(wav_path, language, beam_size, initial_prompt)
++
++    def _transcribe(self, wav_path, language, beam_size, initial_prompt):
+         kwargs = {
+             "beam_size": beam_size,
+             "language": language,
+diff --git a/wyoming_faster_whisper/jarvis-profile.json b/wyoming_faster_whisper/jarvis-profile.json
+new file mode 100644
+index 0000000..a69c2c6
+--- /dev/null
++++ b/wyoming_faster_whisper/jarvis-profile.json
+@@ -0,0 +1,39 @@
++{
++  "schema": 1,
++  "name": "jarvis-personal-precision-01",
++  "source_policy_sha256": "1c01ccdf38de82da846b28a984d4e2d718f76f5d725351b5e5d9ad7409646b21",
++  "feature_layout": "temporal-9x4x1280-prefix5-v1",
++  "first_stage": {
++    "file": "jarvis_ru.tflite",
++    "sha256": "539c98e18a924bc01ae1617295d1f45eada44a223dc893fa063a4c7ae5afbec3"
++  },
++  "head": {
++    "file": "verifier.joblib",
++    "sha256": "d7930f1f8ec74a47c68265429ffe3e5650d69a42f395dfd106079fe82ce64af9"
++  },
++  "encoder_sha256": "69f74147e3334731bc3a76048724833325d2ec74642fb52620eda87352e3d4f1",
++  "gpu_versions": {
++    "faster-whisper": "1.2.1",
++    "ctranslate2": "4.8.3",
++    "numpy": "2.5.4"
++  },
++  "pool_shifts_s": [
++    -0.32,
++    -0.24,
++    -0.16,
++    -0.08,
++    0,
++    0.08,
++    0.16,
++    0.24,
++    0.32
++  ],
++  "pre_roll_ms": 2500,
++  "post_roll_ms": 1000,
++  "warmup_ms": 2000,
++  "refractory_ms": 2000,
++  "verifier_threshold": -0.25,
++  "maximum_confirmation_ms": 1750,
++  "rpc_timeout_s": 0.5,
++  "handoff": "adapter-buffered-stt-v1"
++}
+diff --git a/wyoming_faster_whisper/jarvis_encoder.py b/wyoming_faster_whisper/jarvis_encoder.py
+new file mode 100644
+index 0000000..e1b51c4
+--- /dev/null
++++ b/wyoming_faster_whisper/jarvis_encoder.py
+@@ -0,0 +1,283 @@
++"""Opt-in Jarvis encoder RPC sharing the resident STT model and its weights.
++
++Two CT2 workers share weights on one GPU;at most one STT and one encoder inference
++run concurrently. Encoder admission is independent of STT occupancy.
++"""
++
++import asyncio
++import contextlib
++import copy
++import hashlib
++import importlib.metadata
++import json
++import logging
++import re
++import threading
++import time
++from pathlib import Path
++from urllib.parse import urlsplit
++
++import numpy as np
++
++CROP_BYTES = 112000
++FEATURE_BYTES = 9 * 5120 * 4
++LAYOUT = "temporal-9x4x1280-prefix5-v1"
++LOGGER = logging.getLogger(__name__)
++
++
++def log(logger, event, **fields):
++    logger.info("%s %s", event, fields)
++
++
++class Profile:
++    def __init__(self, path):
++        raw = Path(path).read_bytes()
++        self.digest = hashlib.sha256(raw).hexdigest()
++        self.data = json.loads(raw)
++        if (
++            self.data.get("feature_layout") != LAYOUT
++            or self.data.get("handoff") != "adapter-buffered-stt-v1"
++        ):
++            raise ValueError("unsupported Jarvis profile")
++
++    def validate_backend(self, directory):
++        versions = {k: importlib.metadata.version(k) for k in self.data["gpu_versions"]}
++        if versions != self.data["gpu_versions"]:
++            raise ValueError("Jarvis GPU library versions differ from the validated backend")
++        with (Path(directory) / "model.bin").open("rb") as f:
++            digest = hashlib.file_digest(f, "sha256").hexdigest()
++        if digest != self.data["encoder_sha256"]:
++            raise ValueError("Jarvis requires the validated full large-v3 weights")
++
++
++class SttGate:
++    """One active and one waiting STT call leave the other CT2 worker for wake."""
++
++    def __init__(self):
++        self.admission = threading.BoundedSemaphore(2)
++        self.active = threading.Lock()
++
++    def run(self, function, *args, **kwargs):
++        if not self.admission.acquire(blocking=False):
++            raise RuntimeError("STT queue full")
++        acquired = False
++        try:
++            acquired = self.active.acquire(timeout=3)
++            if not acquired:
++                raise RuntimeError("STT queue deadline exceeded")
++            return function(*args, **kwargs)
++        finally:
++            if acquired:
++                self.active.release()
++            self.admission.release()
++
++
++class SharedEncoder:
++    def __init__(self, model, profile):
++        # Reuse the exact resident WhisperModel;never construct another model.
++        self.model = model
++        self.profile = profile
++        self.feature_extractor = copy.deepcopy(model.feature_extractor)
++
++    def encode(self, pcm):
++        import ctranslate2
++        from faster_whisper.audio import pad_or_trim
++
++        if len(pcm) != CROP_BYTES:
++            raise ValueError("encoder requires exactly3.5s PCM16/16k")
++        audio = np.frombuffer(pcm, "<i2").astype(np.float32) / 32768
++        storage = self.model.encode(pad_or_trim(self.feature_extractor(audio)))
++        hidden = np.asarray(storage.to_device(ctranslate2.Device.cpu), dtype=np.float32)
++        if hidden.shape != (1, 1500, 1280):
++            raise ValueError("unexpected encoder dimensions")
++        times = np.arange(1500) * 0.02
++        values = []
++        for shift in self.profile.data["pool_shifts_s"]:
++            end = 2.5 + 0.56 + shift
++            part = hidden[0, (times > end - 1.28 + 1e-8) & (times <= end + 1e-8)]
++            if len(part) != 64:
++                raise ValueError("unexpected encoder temporal layout")
++            values.append(np.concatenate([np.mean(b, axis=0) for b in np.array_split(part, 4)]))
++        return np.asarray(values, dtype="<f4")
++
++
++HEADER_LIMIT = 8192
++
++
++def endpoint(uri: str) -> tuple[str, int]:
++    value = urlsplit(uri)
++    if (
++        value.scheme != "tcp"
++        or not value.hostname
++        or not value.port
++        or value.path
++        or value.query
++        or value.fragment
++        or value.username
++        or value.password
++    ):
++        raise ValueError("encoder URI must be tcp://host:port")
++    return value.hostname, value.port
++
++
++async def read_header(reader: asyncio.StreamReader) -> dict:
++    line = await reader.readline()
++    if not line or len(line) > HEADER_LIMIT:
++        raise ValueError("missing or oversized encoder header")
++    value = json.loads(line)
++    if not isinstance(value, dict) or value.get("protocol") != 1:
++        raise ValueError("unsupported encoder protocol")
++    return value
++
++
++async def write_message(writer: asyncio.StreamWriter, header: dict, payload: bytes = b""):
++    line = json.dumps({"protocol": 1, **header}, allow_nan=False).encode() + b"\n"
++    if len(line) > HEADER_LIMIT:
++        raise ValueError("oversized encoder header")
++    writer.write(line)
++    if payload:
++        writer.write(payload)
++    await writer.drain()
++
++
++async def close_writer(writer: asyncio.StreamWriter):
++    writer.close()
++    with contextlib.suppress(OSError, asyncio.TimeoutError):
++        await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
++
++
++class EncoderServer:
++    def __init__(self, profile: Profile, encoder, max_pending: int = 2):
++        self.profile, self.encoder = profile, encoder
++        self.max_pending, self.pending = max_pending, 0
++        self.lock = asyncio.Lock()
++
++    def identity(self, request_id: str) -> dict:
++        return {
++            "ok": True,
++            "request_id": request_id,
++            "profile_sha256": self.profile.digest,
++            "encoder_sha256": self.profile.data["encoder_sha256"],
++        }
++
++    async def handle(self, reader, writer) -> None:
++        reserved = False
++        request_id = "invalid"
++        try:
++            async with asyncio.timeout(1):
++                request = await read_header(reader)
++            request_id = request.get("request_id", "")
++            if not isinstance(request_id, str) or not re.fullmatch(
++                r"[A-Za-z0-9_-]{1,80}", request_id
++            ):
++                raise ValueError("invalid request identity")
++            if request.get("profile_sha256") != self.profile.digest:
++                raise ValueError("profile identity differs")
++            if request.get("op") == "health":
++                await write_message(writer, self.identity(request_id) | {"payload_bytes": 0})
++                return
++            if request.get("op") != "encode" or request.get("payload_bytes") != CROP_BYTES:
++                raise ValueError("invalid encoder request")
++            if self.pending >= self.max_pending:
++                raise ValueError("encoder queue is full")
++            self.pending += 1
++            reserved = True
++            async with asyncio.timeout(0.5):
++                pcm = await reader.readexactly(CROP_BYTES)
++            before = time.monotonic()
++            async with self.lock:
++                # Keep the lock until the native worker actually finishes on cancellation.
++                task = asyncio.create_task(asyncio.to_thread(self.encoder.encode, pcm))
++                try:
++                    features = await asyncio.shield(task)
++                except asyncio.CancelledError:
++                    await task
++                    raise
++            features = np.asarray(features, dtype="<f4")
++            if features.shape != (9, 5120) or not np.isfinite(features).all():
++                raise ValueError("encoder produced invalid features")
++            payload = features.tobytes()
++            assert len(payload) == FEATURE_BYTES
++            elapsed = (time.monotonic() - before) * 1000
++            await write_message(
++                writer,
++                self.identity(request_id)
++                | {
++                    "layout": LAYOUT,
++                    "payload_bytes": len(payload),
++                    "compute_ms": elapsed,
++                },
++                payload,
++            )
++            log(LOGGER, "encoded", request=request_id, elapsed_ms=round(elapsed, 2))
++        except (ValueError, OSError, asyncio.IncompleteReadError, TimeoutError) as error:
++            try:
++                await write_message(
++                    writer,
++                    {
++                        "ok": False,
++                        "request_id": request_id,
++                        "error": str(error),
++                        "payload_bytes": 0,
++                    },
++                )
++            except OSError:
++                pass
++            log(LOGGER, "encode_rejected", error=str(error), request=request_id)
++        except Exception:
++            LOGGER.exception("encoder_failure")
++        finally:
++            if reserved:
++                self.pending -= 1
++            await close_writer(writer)
++
++
++async def start(transcriber, profile, uri):
++    from .faster_whisper_handler import FasterWhisperTranscriber
++
++    if not isinstance(transcriber, FasterWhisperTranscriber):
++        raise ValueError("Jarvis requires faster-whisper")
++    if (
++        transcriber.model.model.device != "cuda"
++        or transcriber.model.model.compute_type != "float16"
++    ):
++        raise ValueError("Jarvis requires CUDA float16")
++    transcriber.jarvis_stt_gate = SttGate()
++    encoder = SharedEncoder(transcriber.model, profile)
++    for _ in range(3):
++        await asyncio.to_thread(encoder.encode, bytes(CROP_BYTES))
++    service = EncoderServer(profile, encoder, max_pending=1)
++    server = await asyncio.start_server(service.handle, *endpoint(uri), limit=HEADER_LIMIT)
++    LOGGER.info(
++        "Jarvis encoder ready:profile=%s shared_model_id=%s workers=2",
++        profile.digest,
++        id(transcriber.model),
++    )
++    return server
++
++
++async def check_health(uri):
++    from .health_check import check
++
++    profile = Profile(Path(__file__).with_name("jarvis-profile.json"))
++    async with asyncio.timeout(2):
++        await check("tcp://127.0.0.1:10300")
++        reader, writer = await asyncio.open_connection(*endpoint(uri), limit=HEADER_LIMIT)
++        try:
++            await write_message(writer, {"op": "health", "request_id": "health",
++                                        "profile_sha256": profile.digest})
++            response = await read_header(reader)
++            if (not response.get("ok") or response.get("profile_sha256") != profile.digest
++                    or response.get("encoder_sha256") != profile.data["encoder_sha256"]
++                    or response.get("payload_bytes") != 0):
++                raise ValueError("incompatible shared encoder health")
++        finally:
++            await close_writer(writer)
++
++
++if __name__ == "__main__":
++    import argparse
++
++    parser = argparse.ArgumentParser(description="Health check, no inference or model load")
++    parser.add_argument("--check", required=True, help="tcp://127.0.0.1:10500")
++    asyncio.run(check_health(parser.parse_args().check))
+diff --git a/wyoming_faster_whisper/models.py b/wyoming_faster_whisper/models.py
+index 693cf18..dd90fc6 100644
+--- a/wyoming_faster_whisper/models.py
++++ b/wyoming_faster_whisper/models.py
+@@ -54,9 +54,11 @@ class ModelLoader:
+         vad_clip_threshold: float = 0.5,
+         vad_clip_pad_ms: int = 400,
+         vad_clip_libraries: Optional[Set[SttLibrary]] = None,
++        whisper_num_workers: int = 1,
+     ) -> None:
+         self.preferred_stt_library = preferred_stt_library
+         self.preferred_language = preferred_language
++        self.whisper_num_workers = whisper_num_workers
+         self.sherpa_streaming = sherpa_streaming
+ 
+         self.download_dir = Path(download_dir)
+@@ -308,6 +310,7 @@ class ModelLoader:
+             cpu_threads=self.cpu_threads,
+             vad_parameters=self.vad_parameters,
+             task=self.whisper_task,
++            num_workers=self.whisper_num_workers,
+         )
+ 
+     async def transcribe(
